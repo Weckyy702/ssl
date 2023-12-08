@@ -1,58 +1,147 @@
 use std::{
     collections::{HashMap, VecDeque},
+    fmt::Display,
     iter::Peekable,
     num::ParseFloatError,
+    rc::Rc,
 };
+
+use once_cell::sync::Lazy;
 
 use thiserror::Error;
 
-struct FunctionDescriptor {
-    name: String,
-    operations: Vec<Operation>,
+macro_rules! pop_as {
+    ($state:ident,$type:ident) => {{
+        let Value::$type(v) = $state.pop()? else {
+            return Err(ExecuteError::TypeMismatch(FlyString::from_str(stringify!(
+                $type
+            ))));
+        };
+        v
+    }};
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct FlyString(Rc<str>);
+
+impl std::fmt::Debug for FlyString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl FlyString {
+    fn from_string(s: String) -> Self {
+        let strings = Self::interned_strings();
+
+        if let Some(s) = strings.get(&s) {
+            return Self(Rc::clone(s));
+        }
+        let s = Rc::clone(strings.entry(s.clone()).or_insert(s.into()));
+        Self(s)
+    }
+
+    fn from_str(s: &str) -> Self {
+        let strings = Self::interned_strings();
+
+        if let Some(s) = strings.get(s) {
+            return Self(Rc::clone(s));
+        }
+        let s = Rc::clone(strings.entry(s.into()).or_insert(s.into()));
+        Self(s)
+    }
+
+    fn interned_strings() -> &'static mut HashMap<String, Rc<str>> {
+        static mut STRINGS: Lazy<HashMap<String, Rc<str>>> = Lazy::new(HashMap::default);
+        //SAFETY: we only create FlyStrings on one thread
+        unsafe { &mut STRINGS }
+    }
+}
+
+impl From<String> for FlyString {
+    fn from(value: String) -> Self {
+        Self::from_string(value)
+    }
+}
+
+impl From<&str> for FlyString {
+    fn from(value: &str) -> Self {
+        Self::from_str(value)
+    }
+}
+
+impl Display for FlyString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
 
 #[derive(Debug, Clone)]
-enum Value {
-    Boolean(bool),
-    Number(f64),
-    String(String),
+struct FunctionDescriptor {
+    operations: Vec<Operation>,
+    num_args: usize,
 }
 
-#[derive(Debug)]
+type BuiltinFuntion = fn(&mut MachineState) -> Result<(), ExecuteError>;
+
+#[derive(Debug, Clone)]
+enum Value {
+    Bool(bool),
+    Number(f64),
+    Function(Rc<FunctionDescriptor>),
+    Builtin(BuiltinFuntion),
+    String(FlyString),
+}
+
+impl From<f64> for Value {
+    fn from(value: f64) -> Self {
+        Self::Number(value)
+    }
+}
+
+impl From<String> for Value {
+    fn from(value: String) -> Self {
+        Self::String(value.into())
+    }
+}
+
+impl From<&str> for Value {
+    fn from(value: &str) -> Self {
+        Self::String(value.into())
+    }
+}
+
+#[derive(Debug, Clone)]
 enum Operation {
-    // Stack operations
     Push(Value),
-    Pop,
-    Swap,
-    Dup,
-    Assign,
-    PushFrom(String),
-    // Math
-    Add,
-    Sub,
-    Mul,
-    Div,
-    //Misc
-    Print,
+    PushId(FlyString),
+    PushRaw(FlyString),
+    PushArg(usize),
+    If(Vec<Operation>, Vec<Operation>),
+    Return,
 }
 
 #[derive(Error, Debug)]
 enum ParseError {
-    #[error("Unknown character {0}")]
-    UnknownCharacter(char),
     #[error("Invalid numeric literal {0}")]
     InvalidNumber(ParseFloatError),
     #[error("Must have an identifier after $")]
-    InvalidPushFrom,
+    InvalidRawPush,
+    #[error("Unclosed string literal")]
+    InvalidString,
 }
 
-fn read_string<I: Iterator<Item = char>>(input: &mut Peekable<I>, c: Option<char>) -> String {
+fn read_while<I, F>(input: &mut Peekable<I>, c: Option<char>, f: F) -> String
+where
+    I: Iterator<Item = char>,
+    F: Fn(&char) -> bool,
+{
     let mut s = String::with_capacity(10);
     if let Some(c) = c {
         s.push(c);
     }
     while let Some(c) = input.peek() {
-        if c.is_ascii_whitespace() {
+        if !f(c) {
             break;
         }
         s.push(*c);
@@ -61,15 +150,18 @@ fn read_string<I: Iterator<Item = char>>(input: &mut Peekable<I>, c: Option<char
     s
 }
 
-fn parse_function<I: Iterator<Item = char>>(
+fn read_string<I: Iterator<Item = char>>(input: &mut Peekable<I>, c: Option<char>) -> String {
+    read_while(input, c, |c| !c.is_ascii_whitespace())
+}
+
+fn parse_internal<I: Iterator<Item = char>>(
     input: &mut Peekable<I>,
-    name: String,
 ) -> Result<FunctionDescriptor, ParseError> {
     use Operation as O;
 
     let mut f = FunctionDescriptor {
-        name,
         operations: vec![],
+        num_args: 0,
     };
 
     while let Some(c) = input.next() {
@@ -92,28 +184,46 @@ fn parse_function<I: Iterator<Item = char>>(
                     .map(O::Push)
                     .map_err(ParseError::InvalidNumber)?
             }
-            '+' => O::Add,
-            '-' => O::Sub,
-            '*' => O::Mul,
-            '/' => O::Div,
-            '!' => O::Pop,
-            ':' => {
-                if let Some('=') = input.peek() {
-                    input.next();
-                    O::Assign
-                } else {
-                    return Err(ParseError::UnknownCharacter(c));
-                }
-            }
             '$' => {
                 let name = read_string(input, None);
                 if name.is_empty() {
-                    return Err(ParseError::InvalidPushFrom);
+                    return Err(ParseError::InvalidRawPush);
                 }
-                O::PushFrom(name)
+
+                if let Ok(index) = name.parse::<usize>() {
+                    f.num_args = usize::max(index + 1, f.num_args);
+                    O::PushArg(index)
+                } else {
+                    O::PushRaw(name.into())
+                }
             }
-            '?' => O::Print,
-            c => O::Push(Value::String(read_string(input, Some(c)))),
+            '\'' => {
+                let s = read_while(input, None, |c| !c.is_ascii_whitespace() && *c != '\'');
+                let Some('\'') = input.next() else {
+                    return Err(ParseError::InvalidString);
+                };
+                O::Push(Value::String(s.into()))
+            }
+            c => {
+                let s = read_string(input, Some(c));
+                match s.as_str() {
+                    "end" => break,
+                    "fn" => {
+                        let f = parse_internal(input)?;
+                        O::Push(Value::Function(f.into()))
+                    }
+                    "if" => {
+                        let FunctionDescriptor {
+                            operations,
+                            num_args,
+                        } = parse_internal(input)?;
+                        f.num_args = usize::max(f.num_args, num_args);
+                        O::If(operations, vec![])
+                    }
+                    "ret" => O::Return,
+                    _ => O::PushId(s.into()),
+                }
+            }
         };
         f.operations.push(op);
     }
@@ -121,16 +231,101 @@ fn parse_function<I: Iterator<Item = char>>(
     Ok(f)
 }
 
-fn parse(input: impl Iterator<Item = char>) -> Result<Vec<FunctionDescriptor>, ParseError> {
-    let mut input = input.peekable();
-    let mut functions = vec![];
-    functions.push(parse_function(&mut input, "main".into())?);
-    Ok(functions)
+fn parse<I: Iterator<Item = char>>(input: I) -> Result<FunctionDescriptor, ParseError> {
+    parse_internal(&mut input.peekable())
 }
 
-#[derive(Debug, Default)]
+macro_rules! numeric_biop_impl {
+    ($name:ident, $op:tt, $output:ident) => {
+        fn $name(state: &mut MachineState) -> Result<(), ExecuteError> {
+            use Value as V;
+            let a = pop_as!(state, Number);
+            let b = pop_as!(state, Number);
+            state.push(V::$output(a $op b));
+            Ok(())
+        }
+    };
+}
+
+numeric_biop_impl!(add, +, Number);
+numeric_biop_impl!(sub, -, Number);
+numeric_biop_impl!(mul, *, Number);
+numeric_biop_impl!(div, /, Number);
+
+numeric_biop_impl!(lt, <, Bool);
+
+fn print(state: &mut MachineState) -> Result<(), ExecuteError> {
+    use Value as V;
+    match state.pop() {
+        Ok(V::Bool(b)) => println!("{b}"),
+        Ok(V::Number(x)) => println!("{x}"),
+        Ok(V::String(s)) => println!("{s}"),
+        Ok(V::Function(_)) | Ok(V::Builtin(_)) => println!("<function>"),
+        Err(_) => println!("<empty>"),
+    }
+    Ok(())
+}
+
+fn assign(state: &mut MachineState) -> Result<(), ExecuteError> {
+    let name = pop_as!(state, String);
+    let value = state.pop()?;
+
+    state.current_scope_mut().set(name, value);
+
+    Ok(())
+}
+
+#[derive(Debug)]
 struct Scope {
-    names: HashMap<String, Value>,
+    names: HashMap<FlyString, Value>,
+    args: Vec<Value>,
+    inherits_from_parent: bool,
+}
+
+impl Scope {
+    fn global(args: Vec<Value>) -> Self {
+        Self {
+            names: HashMap::from([
+                ("+".into(), Value::Builtin(add)),
+                ("-".into(), Value::Builtin(sub)),
+                ("*".into(), Value::Builtin(mul)),
+                ("/".into(), Value::Builtin(div)),
+                ("<".into(), Value::Builtin(lt)),
+                (".".into(), Value::Builtin(print)),
+                (":=".into(), Value::Builtin(assign)),
+            ]),
+            args,
+            inherits_from_parent: false,
+        }
+    }
+
+    fn function(args: Vec<Value>) -> Self {
+        Self {
+            names: Default::default(),
+            args,
+            inherits_from_parent: false,
+        }
+    }
+
+    fn conditional() -> Self {
+        Self {
+            names: Default::default(),
+            args: Default::default(),
+            inherits_from_parent: true,
+        }
+    }
+
+    fn get(&self, id: &FlyString) -> Option<Value> {
+        self.names.get(id).cloned()
+    }
+
+    fn set(&mut self, name: FlyString, value: Value) {
+        self.names.insert(name, value);
+    }
+
+    fn get_arg(&self, index: usize) -> Option<Value> {
+        self.args.get(index).cloned()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -139,90 +334,178 @@ struct MachineState {
     stack: VecDeque<Value>,
 }
 
-fn execute_function(MachineState { scopes, stack }: &mut MachineState, f: &FunctionDescriptor) {
-    use Operation as O;
-    use Value as V;
-
-    macro_rules! pop_as {
-        ($type:ident,$msg:literal) => {{
-            let Some(V::$type(x)) = stack.pop_back() else {
-                panic!($msg);
-            };
-            x
-        }};
+impl MachineState {
+    fn pop(&mut self) -> Result<Value, ExecuteError> {
+        self.stack.pop_back().ok_or(ExecuteError::EmptyStack)
     }
 
-    scopes.push_back(Scope::default());
-    let current_scope = scopes.back_mut().unwrap();
+    fn push(&mut self, value: Value) {
+        self.stack.push_back(value)
+    }
+
+    fn global_scope(&self) -> &Scope {
+        self.scopes.front().expect("Has global scope")
+    }
+
+    fn current_scope(&self) -> &Scope {
+        self.scopes.back().expect("Has at least one scope")
+    }
+
+    fn current_scope_mut(&mut self) -> &mut Scope {
+        self.scopes.back_mut().expect("Has at least one scope")
+    }
+
+    fn look_up(&self, name: &FlyString) -> Option<Value> {
+        let mut scopes = self.scopes.iter().rev();
+        while let Some(scope) = scopes.next() {
+            if let Some(var) = scope.get(name) {
+                return Some(var);
+            }
+            if !scope.inherits_from_parent {
+                break;
+            }
+        }
+        None
+    }
+
+    fn get_arg(&self, index: usize) -> Result<Value, ExecuteError> {
+        let mut scopes = self.scopes.iter().rev();
+        while let Some(scope) = scopes.next() {
+            if let Some(var) = scope.get_arg(index) {
+                return Ok(var);
+            }
+            if !scope.inherits_from_parent {
+                break;
+            }
+        }
+        Err(ExecuteError::UnboundArgument(index))
+    }
+}
+
+#[derive(Debug, Error)]
+enum ExecuteError {
+    #[error("Type mismatch: Expected {0}")]
+    TypeMismatch(FlyString),
+    #[error("Unbound identifier {0}")]
+    UnboundIdentifier(FlyString),
+    #[error("Tried to pop from empty stack")]
+    EmptyStack,
+    #[error("Unbound argument number {0}")]
+    UnboundArgument(usize),
+}
+
+fn push_or_execute(state: &mut MachineState, v: Value) -> Result<(), ExecuteError> {
+    use Value as V;
+    match v {
+        V::Function(f) => execute_function(state, &f)?,
+        V::Builtin(f) => f(state)?,
+        _ => state.push(v),
+    }
+    Ok(())
+}
+
+fn execute_function_code(
+    state: &mut MachineState,
+    operations: &Vec<Operation>,
+) -> Result<bool, ExecuteError> {
+    use Operation as O;
 
     let mut i = 0;
-    while let Some(op) = f.operations.get(i) {
+    while let Some(op) = operations.get(i) {
         match op {
-            O::Push(v) => stack.push_back(v.clone()),
-            O::Pop => {
-                stack.pop_back();
-            }
-            O::Swap => todo!(),
-            O::Dup => todo!(),
-            O::Assign => {
-                let name = pop_as!(String, "Variable name must be a string");
-                let Some(value) = stack.pop_back() else {
-                    panic!("Must have a value to assign");
-                };
-                current_scope.names.insert(name, value);
-            }
-            O::PushFrom(name) => {
-                let Some(value) = current_scope.names.get(name).cloned() else {
-                    panic!("Name {name} is not bound");
-                };
-                stack.push_back(value);
-            }
-            O::Add => {
-                let a = pop_as!(Number, "Cannot add non-numbers");
-                let b = pop_as!(Number, "Cannot add non-numbers");
-                stack.push_back(V::Number(a + b));
-            }
-            O::Sub => {
-                let a = pop_as!(Number, "Cannot subtract non-numbers");
-                let b = pop_as!(Number, "Cannot subtract non-numbers");
-                stack.push_back(V::Number(a - b));
-            }
-            O::Mul => {
-                let a = pop_as!(Number, "Cannot multiply non-numbers");
-                let b = pop_as!(Number, "Cannot multiply non-numbers");
-                stack.push_back(V::Number(a * b));
-            }
-            O::Div => {
-                let a = pop_as!(Number, "Cannot divide non-numbers");
-                let b = pop_as!(Number, "Cannot divide non-numbers");
-                if b == 0. {
-                    panic!("Attempt to divide by zero");
+            O::Push(v) => state.push(v.clone()),
+            O::PushId(id) => {
+                if let Some(v) = state.look_up(&id) {
+                    push_or_execute(state, v)?;
+                } else if let Some(v) = state.global_scope().get(&id) {
+                    push_or_execute(state, v)?;
+                } else {
+                    return Err(ExecuteError::UnboundIdentifier(id.clone()));
                 }
-                stack.push_back(V::Number(a / b));
             }
-            O::Print => {
-                println!("{:?}", stack.pop_back());
+            O::PushRaw(id) => {
+                if let Some(v) = state.look_up(&id) {
+                    state.push(v);
+                } else if let Some(v) = state.global_scope().get(&id) {
+                    state.push(v);
+                } else {
+                    return Err(ExecuteError::UnboundIdentifier(id.clone()));
+                }
             }
+            O::PushArg(index) => {
+                push_or_execute(state, state.get_arg(*index)?)?;
+            }
+            O::If(if_body, else_body) => {
+                let condition = pop_as!(state, Bool);
+                if condition {
+                    state.scopes.push_back(Scope::conditional());
+                    let do_return = execute_function_code(state, &if_body)?;
+                    state.scopes.pop_back();
+                    if do_return {
+                        return Ok(true);
+                    }
+                } else {
+                    assert!(else_body.len() == 0);
+                }
+            }
+            O::Return => return Ok(true),
         }
         i += 1;
     }
 
-    scopes.pop_back();
+    Ok(false)
 }
 
-fn main() -> Result<(), ParseError> {
-    let input = "12 2 + x ??";
+fn execute_function(state: &mut MachineState, f: &FunctionDescriptor) -> Result<(), ExecuteError> {
+    //TOOD: double allocation :(
+    let args = (0..(f.num_args))
+        .map(|_| state.pop())
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .rev()
+        .collect();
+    state.scopes.push_back(Scope::function(args));
+    execute_function_code(state, &f.operations)?;
+    state.scopes.pop_back();
+    Ok(())
+}
 
-    let functions = parse(input.chars())?;
-
-    for op in &functions[0].operations {
-        println!("{:?}", op);
-    }
-
+fn execute(
+    main_function: &FunctionDescriptor,
+    input_args: Vec<Value>,
+) -> Result<MachineState, ExecuteError> {
     let mut state = MachineState::default();
-    execute_function(&mut state, &functions[0]);
+    state.scopes.push_back(Scope::global(input_args));
+    execute_function_code(&mut state, &main_function.operations)?;
+    Ok(state)
+}
 
-    println!("{:?}", state);
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let input = r"
+        fn 
+            1 $0 < if
+                0 ret
+            end
+            1 $0 - sum $0 +
+        end 'sum' :=
+
+        fn
+            2 $0 < if
+                $0 ret
+            end
+            1 $0 - fib 2 $0 - fib +
+        end 'fib' :=
+
+        25 fib .
+    ";
+
+    let function = parse(input.chars())?;
+
+    /*for op in &function.operations {
+        println!("{op:?}");
+    }*/
+
+    println!("{:?}", execute(&function, vec![1f64.into(), 2f64.into(),])?);
 
     Ok(())
 }
